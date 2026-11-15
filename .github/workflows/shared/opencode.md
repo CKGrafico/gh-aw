@@ -89,7 +89,7 @@ engine:
         });
         writeSecureOutput("/tmp/gh-aw/opencode-mcp.json", JSON.stringify({ mcp: { servers } }, null, 2));
     harness-script: |
-      const { readFileSync } = require("fs");
+      const { existsSync, readFileSync } = require("fs");
       const { execFile } = require("child_process");
       const { runProcess } = require("./process_runner.cjs");
       const { isOpenCodeEvent, getOpenCodeMCPFailures, getOpenCodeSessionSteps } = require("./parse_opencode_log.cjs");
@@ -109,6 +109,17 @@ engine:
         if (!["github", "anthropic", "openai"].includes(provider)) {
           throw new Error("GH_AW_LLM_PROVIDER must be github, anthropic, or openai");
         }
+        // The model roster. The lead model (OPENCODE_MODEL) is always declared; a workflow
+        // names additional models through GH_AW_OPENCODE_MODELS (comma-separated) so per-agent
+        // `model:` values in the repository's OpenCode configuration resolve. Every model rides
+        // the awf-proxy provider, so the deny-all provider policy and the placeholder key stay
+        // intact. A run whose cast is one model (the default) sees no change.
+        const rosterEnv = process.env.GH_AW_OPENCODE_MODELS || "";
+        const roster = rosterEnv
+          .split(",")
+          .map(entry => entry.trim())
+          .filter((entry, index, all) => entry && all.indexOf(entry) === index);
+        if (!roster.includes(model)) roster.unshift(model);
         const rawMaxTurns = process.env.GH_AW_MAX_TURNS;
         const maxTurns = rawMaxTurns === undefined || rawMaxTurns === "" ? undefined : Number(rawMaxTurns);
         if (maxTurns !== undefined && (!Number.isSafeInteger(maxTurns) || maxTurns <= 0)) {
@@ -171,7 +182,7 @@ engine:
               name: "GitHub Agentic Workflows",
               package: isAnthropic ? "@opencode/ai/providers/anthropic" : "@opencode/ai/providers/openai-compatible",
               settings: { baseURL, apiKey },
-              models: { [model]: { name: model } },
+              models: Object.fromEntries(roster.map(entry => [entry, { name: entry }])),
             },
           },
         };
@@ -201,7 +212,39 @@ engine:
         const observedMCPFailures = new Set();
         const runtimeEnv = { ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify(config) };
         delete runtimeEnv.PWD;
-        const result = await runProcess({
+        const handleEvent = line => {
+          let entry;
+          try { entry = JSON.parse(line); } catch { return; }
+          if (!isOpenCodeEvent(entry)) return;
+          if (entry.sessionID) sessionID = entry.sessionID;
+          if (entry?.type === "error" && entry.error) reportedError = true;
+          if (maxTurns !== undefined && entry.type === "tool_use" && entry.part?.state?.status === "error" && entry.part.state.error === "Tools are disabled after the maximum agent steps") {
+            maxTurnsHit = true;
+          }
+          if (entry?.type !== "step_finish") return;
+          const messageIdentity = typeof entry.part.messageID === "string" ? JSON.stringify([entry.sessionID, entry.part.messageID]) : undefined;
+          const identity = messageIdentity ?? (typeof entry.part.id === "string" ? JSON.stringify([entry.sessionID, "part", entry.part.id]) : undefined);
+          if (identity !== undefined && finishedSteps.has(identity)) return;
+          if (identity !== undefined) finishedSteps.add(identity);
+            if (messageIdentity !== undefined) finishedMessageParts.set(messageIdentity, { id: entry.part.id, messageID: entry.part.messageID });
+          turns++;
+          if (maxTurns !== undefined && turns >= maxTurns && entry.part?.reason === "tool-calls") {
+            maxTurnsHit = true;
+          }
+        };
+        // A run that ends in text ends `opencode run`, whatever the text promised: an agent
+        // that writes "let me discover the exact safeoutputs command" and stops has produced
+        // nothing, and OpenCode exits zero all the same. When the run exited clean but no safe
+        // output exists yet, the same session is continued (`--session <id>`, the ID already
+        // captured from the event stream), twice at most, and told to finish. A run that exits
+        // non-zero is not worth continuing; neither is one that hit the turn ceiling.
+        const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
+        const hasSafeOutputs = () => {
+          if (!safeOutputsPath || !existsSync(safeOutputsPath)) return false;
+          try { return readFileSync(safeOutputsPath, "utf8").trim().length > 0; } catch { return false; }
+        };
+        const nudgeMessage = "Your last message ended without a tool call, so nothing has been delivered and this run is about to end with no output. Do not explain or plan: continue the task now and finish with the safe-output call the task names.";
+        let result = await runProcess({
           command,
           args: [...commandArgs, "--model", `awf-proxy/${model}`],
           logArgs: [...commandArgs, "--model", "(configured model)"],
@@ -213,28 +256,28 @@ engine:
           onStderrLine: line => {
             for (const server of getOpenCodeMCPFailures(line)) observedMCPFailures.add(server);
           },
-          onStdoutLine: line => {
-            let entry;
-            try { entry = JSON.parse(line); } catch { return; }
-            if (!isOpenCodeEvent(entry)) return;
-            if (entry.sessionID) sessionID = entry.sessionID;
-            if (entry?.type === "error" && entry.error) reportedError = true;
-            if (maxTurns !== undefined && entry.type === "tool_use" && entry.part?.state?.status === "error" && entry.part.state.error === "Tools are disabled after the maximum agent steps") {
-              maxTurnsHit = true;
-            }
-            if (entry?.type !== "step_finish") return;
-            const messageIdentity = typeof entry.part.messageID === "string" ? JSON.stringify([entry.sessionID, entry.part.messageID]) : undefined;
-            const identity = messageIdentity ?? (typeof entry.part.id === "string" ? JSON.stringify([entry.sessionID, "part", entry.part.id]) : undefined);
-            if (identity !== undefined && finishedSteps.has(identity)) return;
-            if (identity !== undefined) finishedSteps.add(identity);
-            if (messageIdentity !== undefined) finishedMessageParts.set(messageIdentity, { id: entry.part.id, messageID: entry.part.messageID });
-            turns++;
-            if (maxTurns !== undefined && turns >= maxTurns && entry.part?.reason === "tool-calls") {
-              maxTurnsHit = true;
-            }
-          },
+          onStdoutLine: handleEvent,
           runtimeGuard: { shouldTerminate: () => ({ terminate: maxTurnsHit, reason: "OpenCode max-turns limit reached" }), pollIntervalMs: 100 },
         });
+        for (let nudge = 1; nudge <= 2; nudge++) {
+          if (result.exitCode !== 0 || maxTurnsHit || hasSafeOutputs() || !sessionID) break;
+          log(`No safe output yet, continuing the session (nudge ${nudge} of 2)`);
+          result = await runProcess({
+            command,
+            args: [...commandArgs, "--session", sessionID],
+            logArgs: [...commandArgs, "--session", "(same session)"],
+            attempt: 0,
+            log,
+            stdin: nudgeMessage,
+            env: runtimeEnv,
+            maxCollectedOutputBytes: 1024 * 1024,
+            onStderrLine: line => {
+              for (const server of getOpenCodeMCPFailures(line)) observedMCPFailures.add(server);
+            },
+            onStdoutLine: handleEvent,
+            runtimeGuard: { shouldTerminate: () => ({ terminate: maxTurnsHit, reason: "OpenCode max-turns limit reached" }), pollIntervalMs: 100 },
+          });
+        }
         if (maxTurnsHit) {
           process.stdout.write(JSON.stringify({ type: "opencode.max_turns", timestamp: Date.now(), data: { maxTurns } }) + "\n");
           throw new Error("OpenCode max-turns limit reached");
@@ -324,6 +367,18 @@ configuration or credentials. Provider credentials remain in AWF;
 only a placeholder key reaches the agent. `engine.max-turns` limits completed
 model steps, and a tool-calling turn at the limit fails explicitly.
 MCP startup failures also fail the step, even when OpenCode exits successfully.
+
+The `OPENCODE_MODEL` run model is always declared on the provider.
+Repositories whose OpenCode configuration assigns different `model:` values per
+agent can list them in `GH_AW_OPENCODE_MODELS` (comma-separated); every listed
+model rides the same proxy, so the deny-all policy and the placeholder key are
+unchanged. A run without the variable sees a single-model provider, as before.
+
+A run that exits cleanly but has produced no safe output yet is continued in
+the same session (`--session` with the ID captured from the event stream), at
+most twice, and told to finish with the safe-output call the task names.
+Failed runs, runs that hit the turn ceiling, and runs that already produced
+safe output are not continued.
 Configured MCP startup/tool timeouts are converted from gh-aw seconds to
 OpenCode milliseconds: startup also bounds catalog loading, while tool timeout
 bounds execution.
